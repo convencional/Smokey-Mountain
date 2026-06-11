@@ -1,0 +1,616 @@
+#include "audio.h"
+#include <stdlib.h>
+#include <math.h>
+
+SDL_AudioStream* audio_stream = NULL;
+SomInstancia slotSom = { NULL, 0, 0, false };
+
+static float Frand(void) {
+    return (float)rand() / (float)RAND_MAX * 2.0f - 1.0f;
+}
+
+void GerarSomSFXR(SfxrParams* p) {
+    if (slotSom.buffer) { free(slotSom.buffer); slotSom.buffer = NULL; }
+
+    float fperiod = 100.0f / (p->p_base_freq * p->p_base_freq * 9.0f + 0.001f);
+    float max_period = 100.0f / (p->p_freq_limit * p->p_freq_limit * 9.0f + 0.001f);
+    float fslide = 1.0f - powf(p->p_freq_ramp, 3.0f) * 0.01f;
+    float fdslide = -powf(p->p_freq_dramp, 3.0f) * 0.000001f;
+    float square_duty = 0.5f - p->p_duty * 0.5f;
+    float duty_ramp = -p->p_duty_ramp * 0.00005f;
+
+    int t_attack = (int)(p->p_env_attack * p->p_env_attack * 100000.0f);
+    int t_sustain = (int)(p->p_env_sustain * p->p_env_sustain * 100000.0f);
+    int t_decay = (int)(p->p_env_decay * p->p_env_decay * 100000.0f);
+
+    int total_samples = t_attack + t_sustain + t_decay;
+    if (total_samples <= 0) total_samples = 44100 * 0.2f;
+
+    float* pcm_out = (float*)malloc(total_samples * sizeof(float));
+    if (!pcm_out) return;
+
+    int env_stage = 0, env_time = 0;
+    float env_vol = 0.0f, phase = 0.0f;
+    float noise_buffer[32];
+    for (int i = 0; i < 32; i++) noise_buffer[i] = Frand();
+
+    float flpf = powf(p->p_lpf_freq, 3.0f) * 0.1f;
+    float flpfd = 1.0f + p->p_lpf_ramp * 0.0001f;
+    float flpfr = 1.0f - powf(p->p_lpf_resonance, 2.0f) * 0.1f;
+    float flpfv = 0.0f, flpfdv = 0.0f;
+    float fhpf = powf(p->p_hpf_freq, 2.0f) * 0.1f;
+    float fhpfv = 0.0f;
+
+    for (int i = 0; i < total_samples; i++) {
+        env_time++;
+        if (env_stage == 0 && env_time >= t_attack) { env_stage = 1; env_time = 0; }
+        else if (env_stage == 1 && env_time >= t_sustain) { env_stage = 2; env_time = 0; }
+
+        if (env_stage == 0) env_vol = t_attack > 0 ? (float)env_time / t_attack : 1.0f;
+        if (env_stage == 1) env_vol = 1.0f + (1.0f - (t_sustain > 0 ? (float)env_time / t_sustain : 1.0f)) * 2.0f * p->p_env_punch;
+        if (env_stage == 2) env_vol = t_decay > 0 ? 1.0f - (float)env_time / t_decay : 0.0f;
+
+        fperiod *= fslide; fslide += fdslide;
+        if (fperiod > max_period) fperiod = max_period;
+        float period = fperiod;
+
+        if (p->p_vib_strength != 0.0f) {
+            float vib_phase = (float)i * p->p_vib_speed * p->p_vib_speed * 0.05f;
+            period = fperiod * (1.0f + sinf(vib_phase) * p->p_vib_strength * 0.5f);
+        }
+        if (period < 1.0f) period = 1.0f;
+
+        square_duty += duty_ramp;
+        if (square_duty < 0.0f) square_duty = 0.0f;
+        if (square_duty > 0.5f) square_duty = 0.5f;
+
+        phase += 1.0f / period;
+        if (phase >= 1.0f) {
+            phase -= 1.0f;
+            if (p->wave_type == 3) { for (int n = 0; n < 32; n++) noise_buffer[n] = Frand(); }
+        }
+
+        float sample = 0.0f;
+        switch (p->wave_type) {
+        case 0: sample = (phase < square_duty) ? 0.5f : -0.5f; break;
+        case 1: sample = 1.0f - phase * 2.0f; break;
+        case 2: sample = sinf(phase * 2.0f * 3.14159265f); break;
+        case 3: sample = noise_buffer[(int)(phase * 32.0f) & 31]; break;
+        }
+
+        float old_flpfv = flpfv;
+        flpf *= flpfd;
+        if (flpf < 0.0f) flpf = 0.0f; if (flpf > 0.1f) flpf = 0.1f;
+        if (p->p_lpf_freq < 1.0f) { flpfdv += (sample - flpfv) * flpf; flpfdv *= flpfr; }
+        else { flpfv = sample; flpfdv = 0.0f; }
+        flpfv += flpfdv;
+        fhpfv += flpfv - old_flpfv; fhpfv *= (1.0f - fhpf);
+
+        float out = fhpfv * env_vol * p->sound_vol * 2.0f;
+        if (out > 1.0f) out = 1.0f; if (out < -1.0f) out = -1.0f;
+        pcm_out[i] = out;
+    }
+    slotSom.buffer = pcm_out;
+    slotSom.length = total_samples;
+    slotSom.play_ptr = 0;
+    slotSom.ativo = true;
+}
+
+void DispararSomExemplo(void) {
+    if (!audio_stream) return;
+    SfxrParams tiro = {
+        .wave_type = 0, .p_env_attack = 0, .p_env_sustain = 0.277139f,
+        .p_env_punch = 0.281669f, .p_env_decay = 0.364357f, .p_base_freq = 0.809276f,
+        .p_freq_limit = 0.355084f, .p_freq_ramp = -0.334039f, .p_duty = 0.097348f,
+        .p_duty_ramp = 0.032519f, .p_lpf_freq = 1, .p_hpf_freq = 0.115469f, .sound_vol = 0.25f
+    };
+    SDL_ClearAudioStream(audio_stream);
+    GerarSomSFXR(&tiro);
+    if (slotSom.buffer && slotSom.length > 0) {
+        SDL_PutAudioStreamData(audio_stream, slotSom.buffer, slotSom.length * sizeof(float));
+        free(slotSom.buffer);
+        slotSom.buffer = NULL;
+    }
+}
+
+#ifndef AUDIO_H
+#define AUDIO_H
+
+#include <SDL3/SDL.h>
+#include "engine_data.h"
+
+extern SDL_AudioStream* audio_stream;
+extern SomInstancia slotSom;
+
+void GerarSomSFXR(SfxrParams* p);
+void DispararSomExemplo(void);
+
+#endif
+
+#include "dungeon.h"
+
+unsigned char Dungeon[TOTAL_CELLS];
+int Seq[4] = { 0, 3, 1, 2 };
+unsigned char SeedLayout[16][16];
+
+static const unsigned char MasmorraLayouts[8][16][16] = {
+        // Layout 0
+        {
+        {1,1,1,1,1,1,1,0,0,1,1,1,1,1,1,1},
+        {1,1,1,1,1,1,1,0,0,1,1,1,1,1,1,1},
+        {1,1,1,1,1,1,1,0,0,1,1,1,1,1,1,1},
+        {1,1,1,1,1,1,1,0,0,1,1,1,1,1,1,1},
+        {1,1,1,1,1,1,1,0,0,1,1,1,1,1,1,1},
+        {1,1,1,1,1,1,2,0,0,3,1,1,1,1,1,1},
+        {1,1,1,1,1,2,0,0,0,0,3,1,1,1,1,1},
+        {1,1,1,1,1,0,0,0,0,0,0,0,0,0,0,0},
+        {1,1,1,1,1,0,0,0,0,0,0,0,0,0,0,0},
+        {1,1,1,1,1,5,0,0,0,0,4,1,1,1,1,1},
+        {1,1,1,1,1,1,5,0,0,4,1,1,1,1,1,1},
+        {1,1,1,1,1,1,1,0,0,1,1,1,1,1,1,1},
+        {1,1,1,1,1,1,1,0,0,1,1,1,1,1,1,1},
+        {1,1,1,1,1,1,1,0,0,1,1,1,1,1,1,1},
+        {1,1,1,1,1,1,1,0,0,1,1,1,1,1,1,1},
+        {1,1,1,1,1,1,1,0,0,1,1,1,1,1,1,1}
+        },
+    // Layout 1
+        {
+        {1,1,1,1,1,1,1,0,0,1,1,1,1,1,1,1},
+        {1,1,1,1,1,1,2,0,0,3,1,1,1,1,1,1},
+        {1,1,1,1,1,2,0,0,0,0,3,1,1,1,1,1},
+        {1,1,1,1,2,0,0,0,0,0,0,3,1,1,1,1},
+        {1,1,1,2,0,0,0,0,0,0,0,0,3,1,1,1},
+        {1,1,1,0,0,0,0,0,0,0,0,0,0,3,1,1},
+        {1,1,1,0,0,0,0,0,0,0,0,0,0,0,3,1},
+        {1,1,1,0,0,0,0,0,0,0,0,0,0,0,0,0},
+        {1,1,1,0,0,0,0,0,0,0,0,0,0,0,0,0},
+        {1,1,1,0,0,0,0,0,0,0,0,0,0,0,4,1},
+        {1,1,1,0,0,0,0,0,0,0,0,0,0,4,1,1},
+        {1,1,1,5,0,0,0,0,0,0,0,0,4,1,1,1},
+        {1,1,1,1,5,0,0,0,0,0,0,4,1,1,1,1},
+        {1,1,1,1,1,5,0,0,0,0,4,1,1,1,1,1},
+        {1,1,1,1,1,1,5,0,0,4,1,1,1,1,1,1},
+        {1,1,1,1,1,1,1,0,0,1,1,1,1,1,1,1}
+        },
+    // Layout 2
+        {
+        {1,1,1,1,1,1,1,0,0,1,1,1,1,1,1,1},
+        {1,1,1,1,1,1,1,0,0,1,1,1,1,1,1,1},
+        {1,1,1,1,1,1,1,0,0,1,1,1,1,1,1,1},
+        {1,1,1,1,1,1,1,0,0,1,1,1,1,1,1,1},
+        {1,1,1,1,1,1,1,0,0,1,1,1,1,1,1,1},
+        {1,1,1,1,1,1,2,0,0,3,1,1,1,1,1,1},
+        {1,1,1,1,1,2,0,0,0,0,3,1,1,1,1,1},
+        {1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
+        {1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
+        {1,0,0,1,1,5,0,0,0,0,4,1,1,1,1,1},
+        {1,0,0,1,1,1,5,0,0,4,1,1,1,1,1,1},
+        {1,0,0,3,1,1,1,1,1,1,1,1,1,1,1,1},
+        {1,0,0,0,3,1,1,1,1,1,1,1,1,1,1,1},
+        {1,5,0,0,0,0,0,3,1,1,1,1,1,1,1,1},
+        {1,1,5,0,0,0,0,0,3,1,1,1,1,1,1,1},
+        {1,1,1,1,1,1,5,0,0,1,1,1,1,1,1,1}
+        },
+    // Layout 3
+        {
+        {1,1,1,1,1,1,1,0,0,1,1,1,1,1,1,1},
+        {1,1,1,1,1,1,1,0,0,1,1,1,1,1,1,1},
+        {1,1,1,1,1,1,1,0,0,1,1,1,1,1,1,1},
+        {1,1,1,1,1,1,1,0,0,1,1,1,1,1,1,1},
+        {1,1,1,1,1,1,1,0,0,1,1,1,1,1,1,1},
+        {1,1,1,1,1,1,2,0,0,3,1,1,1,1,1,1},
+        {1,1,1,1,1,2,0,0,0,0,3,1,1,1,1,1},
+        {1,1,2,0,0,0,0,0,0,0,0,0,0,0,0,0},
+        {1,2,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
+        {1,0,0,0,4,5,0,0,0,0,4,1,1,1,1,1},
+        {1,0,0,4,1,1,5,0,0,4,1,1,1,1,1,1},
+        {1,0,0,3,1,1,1,1,1,1,1,1,1,1,1,1},
+        {1,0,0,0,3,1,1,1,1,1,1,1,1,1,1,1},
+        {1,5,0,0,0,0,0,3,1,1,1,1,1,1,1,1},
+        {1,1,5,0,0,0,0,0,3,1,1,1,1,1,1,1},
+        {1,1,1,1,1,1,5,0,0,1,1,1,1,1,1,1}
+        },
+    // Layout 4
+        {
+        {1,1,1,1,1,1,1,0,0,1,1,1,1,1,1,1},
+        {1,1,1,1,1,1,2,0,0,3,1,1,1,1,1,1},
+        {1,1,1,1,1,2,0,0,0,0,3,1,1,1,1,1},
+        {1,1,1,1,1,0,0,0,0,0,0,1,1,1,1,1},
+        {1,1,1,1,1,0,0,0,0,0,0,1,1,1,1,1},
+        {1,1,1,1,1,0,0,0,0,0,0,1,1,1,1,1},
+        {1,1,1,1,1,0,0,0,0,0,0,1,1,1,1,1},
+        {1,1,1,1,1,0,0,0,0,0,0,0,0,0,0,0},
+        {1,1,1,1,1,0,0,0,0,0,0,0,0,0,0,0},
+        {1,1,1,1,1,0,0,0,0,0,0,1,1,1,1,1},
+        {1,1,1,1,1,0,0,0,0,0,0,1,1,1,1,1},
+        {1,1,1,1,1,0,0,0,0,0,0,1,1,1,1,1},
+        {1,1,1,1,1,0,0,0,0,0,0,1,1,1,1,1},
+        {1,1,1,1,1,5,0,0,0,0,4,1,1,1,1,1},
+        {1,1,1,1,1,1,5,0,0,4,1,1,1,1,1,1},
+        {1,1,1,1,1,1,1,0,0,1,1,1,1,1,1,1}
+        },
+    // Layout 5
+        {
+        {1,1,1,1,1,1,1,0,0,1,1,1,1,1,1,1},
+        {1,1,1,1,1,0,0,0,0,0,0,1,1,1,1,1},
+        {1,1,1,1,1,0,0,0,0,0,0,1,1,1,1,1},
+        {1,1,1,1,2,0,0,0,0,0,0,3,1,1,1,1},
+        {1,1,1,2,0,0,0,0,0,0,0,0,3,1,1,1},
+        {1,1,1,0,0,0,0,0,0,0,0,0,0,0,0,1},
+        {1,1,1,0,0,0,0,0,0,0,0,0,0,0,0,1},
+        {1,1,1,0,0,0,0,0,0,0,0,0,0,0,0,0},
+        {1,1,1,0,0,0,0,0,0,0,0,0,0,0,0,0},
+        {1,1,1,0,0,0,0,0,0,0,0,0,0,0,0,1},
+        {1,1,1,0,0,0,0,0,0,0,0,0,0,0,0,1},
+        {1,1,1,5,0,0,0,0,0,0,0,0,4,1,1,1},
+        {1,1,1,1,5,0,0,0,0,0,0,4,1,1,1,1},
+        {1,1,1,1,1,0,0,0,0,0,0,1,1,1,1,1},
+        {1,1,1,1,1,0,0,0,0,0,0,1,1,1,1,1},
+        {1,1,1,1,1,1,1,0,0,1,1,1,1,1,1,1}
+        },
+    // Layout 6
+        {
+        {1,1,1,1,1,1,2,0,0,3,1,1,1,1,1,1},
+        {1,1,1,1,1,2,0,0,0,0,3,1,1,1,1,1},
+        {1,1,2,0,0,0,0,0,0,0,0,0,0,3,1,1},
+        {1,2,0,0,0,0,0,0,0,0,0,0,0,0,3,1},
+        {1,0,0,0,4,5,0,0,0,0,4,5,0,0,0,1},
+        {1,0,0,4,1,1,5,0,0,4,1,1,5,0,0,1},
+        {1,0,0,3,1,1,2,0,0,3,1,1,1,0,0,1},
+        {1,0,0,0,3,2,0,0,0,0,3,1,1,0,0,0},
+        {1,5,0,0,0,0,0,0,0,0,0,1,1,0,0,0},
+        {1,1,5,0,0,0,0,0,0,0,0,1,1,1,1,1},
+        {1,1,1,1,1,5,0,0,0,0,4,1,1,1,1,1},
+        {1,1,1,1,1,1,5,0,0,4,1,1,1,1,1,1},
+        {1,1,1,1,1,1,1,0,0,1,1,1,1,1,1,1},
+        {1,1,1,1,1,1,1,0,0,1,1,1,1,1,1,1},
+        {1,1,1,1,1,1,1,0,0,1,1,1,1,1,1,1},
+        {1,1,1,1,1,1,1,0,0,1,1,1,1,1,1,1}
+        },
+    // Layout 7
+        {
+        {1,1,1,1,1,1,2,0,0,3,1,1,1,1,1,1},
+        {1,1,1,1,1,2,0,0,0,0,3,1,1,1,1,1},
+        {1,1,1,1,1,0,0,0,0,0,0,0,0,3,1,1},
+        {1,1,1,1,1,0,0,0,0,0,0,0,0,0,3,1},
+        {1,1,1,1,1,5,0,0,0,0,4,5,0,0,0,1},
+        {1,1,1,1,1,1,5,0,0,4,1,1,5,0,0,1},
+        {1,1,1,1,1,1,2,0,0,3,1,1,1,0,0,3},
+        {1,1,1,1,1,2,0,0,0,0,3,1,1,5,0,0},
+        {1,1,2,0,0,0,0,0,0,0,0,1,1,1,5,0},
+        {1,2,0,0,0,0,0,0,0,0,0,1,1,1,1,1},
+        {1,0,0,0,4,5,0,0,0,0,4,1,1,1,1,1},
+        {1,0,0,0,1,1,5,0,0,4,1,1,1,1,1,1},
+        {1,0,0,0,3,1,1,1,1,1,1,1,1,1,1,1},
+        {1,5,0,0,0,0,0,3,1,1,1,1,1,1,1,1},
+        {1,1,5,0,0,0,0,0,3,1,1,1,1,1,1,1},
+        {1,1,1,1,1,1,5,0,0,1,1,1,1,1,1,1}
+        }
+   };
+
+
+void GerarNovaSemente(void) {
+    for (int y = 0; y < 16; y++) {
+        for (int x = 0; x < 16; x++) {
+            SeedLayout[x][y] = (x + y) % 8 | (Seq[(x + y) & 3] << 3);
+        }
+    }
+}
+
+void BakeDungeon(void) {
+    for (int salaY = 0; salaY < 4; salaY++) {
+        for (int salaX = 0; salaX < 4; salaX++) {
+            int layoutBase = (salaX + salaY) % 8;
+            int rot = Seq[(salaX + salaY) & 3];
+            int bit0 = rot & 1, bit1 = rot >> 1;
+            int invX = 15 * bit1, invY = 15 * (bit0 ^ bit1);
+            for (int tileY = 0; tileY < 16; tileY++) {
+                for (int tileX = 0; tileX < 16; tileX++) {
+                    int rx = bit0 ? tileY : tileX;
+                    int ry = bit0 ? tileX : tileY;
+                    if (bit1) rx = invX - rx;
+                    if (bit0 ^ bit1) ry = invY - ry;
+                    int tileLido = MasmorraLayouts[layoutBase][ry][rx];
+                    if (tileLido > 1 && tileLido <= 5) {
+                        tileLido = 2 + (((tileLido - 2) + rot) & 3);
+                    }
+                    Dungeon[(((salaY << 4) + tileY) << 6) + ((salaX << 4) + tileX)] = tileLido;
+                }
+            }
+        }
+    }
+}
+
+unsigned char CelulaMundo(int mundoX, int mundoY) {
+    return Dungeon[((mundoY & 0x3F0) << 2) + ((mundoX >> 4) & 0x3F)];
+}
+
+#ifndef DUNGEON_H
+#define DUNGEON_H
+
+#include "engine_data.h"
+
+extern unsigned char Dungeon[TOTAL_CELLS];
+extern int Seq[4];
+
+void GerarNovaSemente(void);
+void BakeDungeon(void);
+unsigned char CelulaMundo(int mundoX, int mundoY);
+
+#endif
+
+#ifndef ENGINE_DATA_H
+#define ENGINE_DATA_H
+
+#include <stdint.h>
+#include <stdbool.h>
+
+#define SAMPLE_RATE 44100
+#define MAP_SIZE 64
+#define TOTAL_CELLS (MAP_SIZE * MAP_SIZE)
+#define MAX_FLECHAS 8
+#define ATOR_PLAYER 0
+#define ATOR_INIMIGO 1
+
+typedef struct {
+    int wave_type;
+    float p_env_attack, p_env_sustain, p_env_punch, p_env_decay;
+    float p_base_freq, p_freq_limit, p_freq_ramp, p_freq_dramp;
+    float p_vib_strength, p_vib_speed;
+    float p_arp_mod, p_arp_speed;
+    float p_duty, p_duty_ramp;
+    float p_repeat_speed;
+    float p_pha_offset, p_pha_ramp;
+    float p_lpf_freq, p_lpf_ramp, p_lpf_resonance;
+    float p_hpf_freq, p_hpf_ramp;
+    float sound_vol;
+} SfxrParams;
+
+typedef struct {
+    float* buffer;
+    int32_t length;
+    int32_t play_ptr;
+    bool ativo;
+} SomInstancia;
+
+typedef struct {
+    int32_t ativa;
+    int32_t absX;
+    int32_t absY;
+    int32_t velX;
+    int32_t velY;
+    int32_t idGfx;
+    int32_t flipGfx;
+    int32_t dono;
+} Flecha;
+
+#endif
+
+#include "flechas.h"
+#include "dungeon.h"
+#include "video.h"
+
+int32_t travaTiro = 0;
+static Flecha listaFlechas[MAX_FLECHAS] = { 0 };
+
+const int32_t TabelaTiroKeypad[8] = { 4, 2, 5, 0, 1, 6, 3, 7 };
+
+void CriarFlecha(int32_t origAbsX, int32_t origAbsY, int32_t tiroDirecao, int32_t dono) {
+    if (tiroDirecao == -1) return;
+    for (int f = 0; f < MAX_FLECHAS; f++) {
+        if (listaFlechas[f].ativa == 0) {
+            listaFlechas[f].ativa = 1;
+            listaFlechas[f].dono = dono;
+            listaFlechas[f].absX = origAbsX & 4095;
+            listaFlechas[f].absY = origAbsY & 4095;
+
+            int32_t b0 = tiroDirecao & 1;
+            int32_t b1 = (tiroDirecao >> 1) & 1;
+            int32_t b2 = (tiroDirecao >> 2) & 1;
+
+            listaFlechas[f].idGfx = 6 + b1 + ((b2 << 1) - (b1 * b2));
+            int32_t flipH = (b2 == 0) ? (tiroDirecao == 0) : (b0 ^ 1);
+            int32_t flipV = (b2 == 0) ? ((tiroDirecao == 3) << 1) : (b1 << 1);
+            listaFlechas[f].flipGfx = flipH | flipV;
+
+            int32_t velOrtX = ((tiroDirecao == 1) * 4) - ((tiroDirecao == 0) * 4);
+            int32_t velOrtY = ((tiroDirecao == 3) * 4) - ((tiroDirecao == 2) * 4);
+            int32_t velDiagX = (b0 * 6) - 3;
+            int32_t velDiagY = (b1 * 6) - 3;
+
+            listaFlechas[f].velX = (b2 * velDiagX) + ((1 - b2) * velOrtX);
+            listaFlechas[f].velY = (b2 * velDiagY) + ((1 - b2) * velOrtY);
+            break;
+        }
+    }
+}
+
+void AtualizarFlechas(void) {
+    for (int f = 0; f < MAX_FLECHAS; f++) {
+        if (!listaFlechas[f].ativa) continue;
+        int32_t proxFX = (listaFlechas[f].absX + listaFlechas[f].velX) & 4095;
+        int32_t proxFY = (listaFlechas[f].absY + listaFlechas[f].velY) & 4095;
+        int32_t tileAtingido = CelulaMundo(proxFX, proxFY);
+
+        if (tileAtingido > 0) {
+            int32_t ehDiag = (listaFlechas[f].velX != 0 && listaFlechas[f].velY != 0) & 1;
+            if (ehDiag == 0) {
+                int32_t ehQuina = (tileAtingido >= 2);
+                int32_t b0 = (tileAtingido - 2) & 1;
+                int32_t vX = listaFlechas[f].velX;
+                int32_t vY = listaFlechas[f].velY;
+                listaFlechas[f].velX = (ehQuina * (vY * ((b0 * 2) - 1))) - ((1 - ehQuina) * vX);
+                listaFlechas[f].velY = (ehQuina * (vX * ((b0 * 2) - 1))) - ((1 - ehQuina) * vY);
+            }
+            else {
+                int32_t colX = (CelulaMundo(proxFX, listaFlechas[f].absY) > 0) & 1;
+                int32_t colY = (CelulaMundo(listaFlechas[f].absX, proxFY) > 0) & 1;
+                int32_t ehQuinaParede = (tileAtingido >= 2) & 1;
+                int32_t colVisualQuina = (colX == 0 && colY == 0 && tileAtingido == 1) & 1;
+                int32_t multX = (((colX | colVisualQuina | ehQuinaParede) * -2) + 1);
+                int32_t multY = (((colY | colVisualQuina | ehQuinaParede) * -2) + 1);
+                listaFlechas[f].velX *= multX;
+                listaFlechas[f].velY *= multY;
+                int32_t erroCego = (colX == 0 && colY == 0 && tileAtingido == 0) & 1;
+                listaFlechas[f].velX *= ((erroCego * -2) + 1);
+                listaFlechas[f].velY *= ((erroCego * -2) + 1);
+            }
+            ehDiag = (listaFlechas[f].velX != 0 && listaFlechas[f].velY != 0) & 1;
+            int32_t idBase = 7 + ((listaFlechas[f].velX != 0) & 1) * -1;
+            listaFlechas[f].idGfx = (ehDiag * 8) + ((1 - ehDiag) * idBase);
+            int32_t bitH = (listaFlechas[f].velX < 0) & 1;
+            int32_t bitV = ((listaFlechas[f].velY > 0) & 1) << 1;
+            int32_t confVertical = (listaFlechas[f].idGfx == 7) & 1;
+            bitV = (confVertical * (((listaFlechas[f].velY > 0) & 1) << 1)) + ((1 - confVertical) * bitV);
+            listaFlechas[f].flipGfx = bitH | bitV;
+        }
+        listaFlechas[f].absX = (listaFlechas[f].absX + listaFlechas[f].velX) & 4095;
+        listaFlechas[f].absY = (listaFlechas[f].absY + listaFlechas[f].velY) & 4095;
+    }
+}
+
+void RenderizarFlechas(SDL_Renderer* r, SDL_Texture* t, int32_t atualCamX, int32_t atualCamY) {
+    for (int f = 0; f < MAX_FLECHAS; f++) {
+        if (!listaFlechas[f].ativa) continue;
+        int32_t fX_Tela = listaFlechas[f].absX - atualCamX;
+        int32_t fY_Tela = listaFlechas[f].absY - atualCamY;
+        if (fX_Tela > 160) fX_Tela -= 4096;
+        if (fX_Tela < -160) fX_Tela += 4096;
+        if (fY_Tela > 120) fY_Tela -= 4096;
+        if (fY_Tela < -120) fY_Tela += 4096;
+        DesenharGrafico(r, t, listaFlechas[f].idGfx, fX_Tela, fY_Tela, 8, 8, 8, 8, listaFlechas[f].flipGfx);
+    }
+}
+
+#ifndef FLECHAS_H
+#define FLECHAS_H
+
+#include <SDL3/SDL.h>
+#include "engine_data.h"
+
+extern int32_t travaTiro;
+extern const int32_t TabelaTiroKeypad[8];
+
+void CriarFlecha(int32_t origAbsX, int32_t origAbsY, int32_t tiroDirecao, int32_t dono);
+void AtualizarFlechas(void);
+void RenderizarFlechas(SDL_Renderer* r, SDL_Texture* t, int32_t atualCamX, int32_t atualCamY);
+
+#endif
+
+#include "video.h"
+
+SDL_Texture* tileset_texture = NULL;
+
+static const Uint32 PaletaHexa[256] = {
+    ['E'] = 0xFFFFFF00, // Chão (Amarelo Claro)
+    ['2'] = 0xFF00A000, // Paredes (Verde)
+    ['1'] = 0xFF0000A0, // Arqueiro (Azul Escuro)
+    ['8'] = 0xFF000000  // Flechas (Preto)
+};
+
+static const char* DungeonTilesData[6][8] = {
+    {"EEEEEEEE","EEEEEEEE","EEEEEEEE","EEEEEEEE","EEEEEEEE","EEEEEEEE","EEEEEEEE","EEEEEEEE"},
+    {"22222222","22222222","22222222","22222222","22222222","22222222","22222222","22222222"},
+    {"22222222","2222222E","222222EE","22222EEE","2222EEEE","222EEEEE","22EEEEEE","2EEEEEEE"},
+    {"22222222","E2222222","EE222222","EEE22222","EEEE2222","EEEEE222","EEEEEE22","EEEEEEE2"},
+    {"EEEEEEE2","EEEEEE22","EEEEE222","EEEE2222","EEE22222","EE222222","E2222222","22222222"},
+    {"2EEEEEEE","22EEEEEE","222EEEEE","2222EEEE","22222EEE","222222EE","2222222E","22222222"}
+};
+
+static const char* Sprites8x8Data[3][8] = {
+    {"    8   ","     8  ","      8 ","88888888","      8 ","     8  ","    8   ","        "}, // Flecha H
+    {"   8    ","  888   "," 8 8 8  ","   8    ","   8    ","   8    ","   8    ","   8    "}, // Flecha V
+    {"    888 ","     88 ","    8 8 ","   8    ","  8     "," 8      ","8       ","        "}  // Flecha D
+};
+
+static const char* Sprites8x16Data[4][16] = {
+    {"  111   ",
+    "  1111  ",
+    "      1 ",
+    "  11  1 ",
+    "  11  1 ",
+    "  11  1 ",
+    "  11 1  ",
+    "  111   ",
+    "  11    ",
+    "  11    ",
+    "  11    ",
+    "1111    ",
+    "1 1     ",
+    "1 1     ",
+    "  1     ",
+    "  11    "},
+    // Frame 1
+    {"    11  ","    111 ","       1","  111  1"," 1 111 1"," 1 111 1"," 1 11 1 ","     1  ",
+     "  111   "," 111111 "," 1    1 "," 1  111 "," 1  1   ","1   1   ","1       ","1       "},
+     // Frame 2
+     {"    111 ","    1111"," 111    "," 1 11   "," 1 11111","   11   ","   11  1","      1 ",
+      "   11   ","  111111","  1    1"," 11    1"," 1     1","11      ","1       ","        "},
+      // Frame 3
+      {"     11 ","     111","        ","   111  ","  1111  ","  1 111 ","  1 11 1","      1 ",
+       "  111   ","  1111  ","  1  1  ","111  1  ","1    1  ","1    1  ","     1  ","     11 "}
+};
+
+void CriarTexturasDoJogo(SDL_Renderer* renderer) {
+    SDL_Surface* surface = SDL_CreateSurface(32, 48, SDL_PIXELFORMAT_ARGB8888);
+    if (!surface) return;
+    SDL_ClearSurface(surface, 0, 0, 0, 0);
+    Uint32* pixels = (Uint32*)surface->pixels;
+    int pitch_pixels = surface->pitch / 4;
+
+    for (int t = 0; t < 6; t++) {
+        int tileX = (t % 4) * 8, tileY = (t / 4) * 8;
+        for (int y = 0; y < 8; y++) {
+            const unsigned char* src = (const unsigned char*)DungeonTilesData[t][y];
+            Uint32* dst = &pixels[(tileY + y) * pitch_pixels + tileX];
+            for (int i = 0; i < 8; i++) *dst++ = PaletaHexa[*src++];
+        }
+    }
+    for (int f = 0; f < 3; f++) {
+        int id = 6 + f, tileX = (id % 4) * 8, tileY = (id / 4) * 8;
+        for (int y = 0; y < 8; y++) {
+            const unsigned char* src = (const unsigned char*)Sprites8x8Data[f][y];
+            Uint32* dst = &pixels[(tileY + y) * pitch_pixels + tileX];
+            for (int i = 0; i < 8; i++) *dst++ = PaletaHexa[*src++];
+        }
+    }
+    for (int f = 0; f < 4; f++) {
+        int archX = f * 8, archY = 24;
+        for (int y = 0; y < 16; y++) {
+            const unsigned char* src = (const unsigned char*)Sprites8x16Data[f][y];
+            Uint32* dst = &pixels[(archY + y) * pitch_pixels + archX];
+            for (int i = 0; i < 8; i++) *dst++ = PaletaHexa[*src++];
+        }
+    }
+    tileset_texture = SDL_CreateTextureFromSurface(renderer, surface);
+    SDL_DestroySurface(surface);
+}
+
+void DesenharGrafico(SDL_Renderer* r, SDL_Texture* t, int32_t idGfx,
+    int32_t posX, int32_t posY, int32_t largDest, int32_t altDest,
+    int32_t largOrig, int32_t altOrig, int32_t flip) {
+    if (posX <= -largDest || posX >= 320 || posY <= -altDest || posY >= 240) return;
+    float srcX = (idGfx <= 8) ? (float)((idGfx % 4) * 8) : (float)((idGfx - 9) * 8);
+    float srcY = (idGfx <= 8) ? (float)((idGfx / 4) * 8) : 24.0f;
+
+    SDL_FRect srcRect = { srcX, srcY, (float)largOrig, (float)altOrig };
+    SDL_FRect dstRect = { (float)posX, (float)posY, (float)largDest, (float)altDest };
+    SDL_FlipMode sdlFlip = SDL_FLIP_NONE;
+    if (flip & 1) sdlFlip |= SDL_FLIP_HORIZONTAL;
+    if (flip & 2) sdlFlip |= SDL_FLIP_VERTICAL;
+    SDL_RenderTextureRotated(r, t, &srcRect, &dstRect, 0.0, NULL, sdlFlip);
+}
+#ifndef VIDEO_H
+#define VIDEO_H
+
+#include <SDL3/SDL.h>
+#include "engine_data.h"
+
+extern SDL_Texture* tileset_texture;
+
+void CriarTexturasDoJogo(SDL_Renderer* renderer);
+void DesenharGrafico(SDL_Renderer* r, SDL_Texture* t, int32_t idGfx,
+    int32_t posX, int32_t posY, int32_t largDest, int32_t altDest,
+    int32_t largOrig, int32_t altOrig, int32_t flip);
+
+#endif
